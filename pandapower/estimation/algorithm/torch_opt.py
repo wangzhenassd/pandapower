@@ -35,14 +35,14 @@ def imag_mul(m1r, m1i, m2r, m2i):
 
 
 class TorchEstimator(torch.nn.Module):
-    def __init__(self, ppci,  non_nan_meas_mask):
+    def __init__(self, eppci):
         super(TorchEstimator, self).__init__()      
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             Ybus, Yf, Yt = makeYbus(ppci["baseMVA"], ppci["bus"], ppci["branch"])
             ppci['internal']['Yf'], ppci['internal']['Yt'],\
                 ppci['internal']['Ybus'] = Yf, Yt, Ybus
-            
+
 
         self.baseMVA = ppci['baseMVA']
         Ybus, Yf, Yt = Ybus.toarray(), Yf.toarray(), Yt.toarray()
@@ -59,7 +59,7 @@ class TorchEstimator(torch.nn.Module):
         self.tbus = torch.from_numpy(np.abs(ppci["branch"][:, T_BUS])).type(torch.LongTensor)
         
         # ignore current measurement
-        non_nan_meas_mask = non_nan_meas_mask[:-(self.fbus.shape[0] * 2)]
+        non_nan_meas_mask = eppci.non_nan_meas_mask[:-(self.fbus.shape[0] * 2)]
         self.non_nan_meas_mask = torch.tensor(non_nan_meas_mask.reshape(-1, 1).tolist()).type(torch.ByteTensor)
         self.vi_slack = torch.zeros(self.slack_bus.shape[0], 1, 
                                     requires_grad=False, dtype=torch.double)
@@ -133,26 +133,23 @@ def optimize(model, floss, vr, vi_non_slack):
 
 
 class TorchAlgorithm(WLSAlgorithm):
-    def estimate(self, ppci, opt_vars=None):
-#        assert 'estimator' in opt_vars and opt_vars['estimator'] in ESTIMATOR_MAPPING
-
-        non_slack_buses, v_m, delta, delta_masked, E, r_cov, r_inv, z, non_nan_meas_mask =\
-            self.wls_preprocessing(ppci)
-        
-        model = TorchEstimator(ppci, non_nan_meas_mask=non_nan_meas_mask)
+    def estimate(self, eppci, opt_vars=None):  
+        E = eppci.E
+        model = TorchEstimator(eppci)
         floss = partial(weighted_mse_loss, 
                         target=torch.tensor(z).type(torch.DoubleTensor), 
                         weight=torch.tensor(1/r_cov/100).type(torch.DoubleTensor))
-        vr = torch.tensor(E[len(non_slack_buses):].reshape(-1, 1), 
+        vr = torch.tensor(E[len(eppci.non_slack_buses):].reshape(-1, 1), 
                             dtype=torch.double, requires_grad=True)
-        vi_non_slack = torch.tensor(E[:len(non_slack_buses)].reshape(-1, 1), 
+        vi_non_slack = torch.tensor(E[:len(eppci.non_slack_buses)].reshape(-1, 1), 
                             dtype=torch.double, requires_grad=True)
         res = optimize(model, floss, vr, vi_non_slack)
         
         if res is not None:
             self.successful = True
             vr, vi_non_slack = res
-            vi = np.zeros(np.r_[model.slack_bus, model.non_slack_bus].shape)  
+            
+            vi = np.zeros(np.r_[.slack_bus, model.non_slack_bus].shape)  
             vi[model.non_slack_bus] = vi_non_slack.detach().numpy().ravel()
             vr = vr.detach().numpy().ravel()
             V = vr + vi * 1j

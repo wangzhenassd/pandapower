@@ -6,16 +6,17 @@
 import numpy as np
 from scipy.stats import chi2
 
-from pandapower.pypower.idx_brch import F_BUS, T_BUS, BR_STATUS, PF, PT, QF, QT
-from pandapower.topology import estimate_voltage_vector
-
-from pandapower.estimation.ppc_conversions import _add_measurements_to_ppc, _init_ppc,\
-    _add_aux_elements_for_bb_switch, _drop_aux_elements_for_bb_switch
+from pandapower.estimation.ppc_conversion import (_add_aux_elements_for_bb_switch, 
+                                                  _drop_aux_elements_for_bb_switch, 
+                                                  _initialize_voltage,
+                                                  pp2eppci)
 from pandapower.estimation.toolbox import set_bb_switch_impedance, reset_bb_switch_impedance
-from pandapower.estimation.results import _copy_power_flow_results, _rename_results, _calc_power_flow, _extract_result_ppci_to_pp
+from pandapower.estimation.results import _rename_results, eppci2pp
 from pandapower.estimation.algorithm.wls import WLSAlgorithm, WLSZeroInjectionConstraintsAlgorithm
 from pandapower.estimation.algorithm.optimization import OptAlgorithm
-from pandapower.estimation.algorithm.torch_opt import TorchAlgorithm
+from pandapower.estimation.algorithm.irwls import IRWLSAlgorithm
+from pandapower.estimation.algorithm.lp import LPAlgorithm
+
 
 try:
     import pplog as logging
@@ -26,21 +27,8 @@ std_logger = logging.getLogger(__name__)
 SOLVER_MAPPING = {'wls': WLSAlgorithm,
                   'wls_with_zero_constraint': WLSZeroInjectionConstraintsAlgorithm,
                   'opt': OptAlgorithm,
-                  'torch': TorchAlgorithm}
-
-
-def _initialize_voltage(net, init, calculate_voltage_angles):
-    v_start, delta_start = None, None
-    if init == 'results':
-        v_start, delta_start = 'results', 'results'
-    elif init == 'slack':
-        res_bus = estimate_voltage_vector(net)
-        v_start = res_bus.vm_pu.values
-        if calculate_voltage_angles:
-            delta_start = res_bus.va_degree.values
-    elif init != 'flat':
-        raise UserWarning("Unsupported init value. Using flat initialization.")
-    return v_start, delta_start
+                  'irwls': IRWLSAlgorithm,
+                  'lp': LPAlgorithm}
 
 
 def estimate(net, algorithm='wls', init='flat', tolerance=1e-6, maximum_iterations=10,
@@ -175,7 +163,7 @@ class StateEstimation:
             self.logger = std_logger
             # self.logger.setLevel(logging.DEBUG)
         self.net = net
-        self.solver = SOLVER_MAPPING[algorithm](self.net, tolerance,
+        self.solver = SOLVER_MAPPING[algorithm](tolerance,
                                                 maximum_iterations, self.logger)
 
         # variables for chi^2 / rn_max tests
@@ -254,25 +242,17 @@ class StateEstimation:
                 bus_to_be_fused = fuse_buses_with_bb_switch      
             _add_aux_elements_for_bb_switch(self.net, bus_to_be_fused)
 
-        # initialize result tables if not existent
-        _copy_power_flow_results(self.net)
-
-        # initialize ppc
-        ppc, ppci = _init_ppc(self.net, v_start, delta_start, calculate_voltage_angles)
-
-        # add measurements to ppci structure
-        # Finished converting pandapower network to ppci
-        ppci = _add_measurements_to_ppc(self.net, ppci, zero_injection)
+        self.net, ppc, eppci = pp2eppci(self.net, v_start=v_start, delta_start=delta_start, 
+                              calculate_voltage_angles=calculate_voltage_angles, 
+                              zero_injection=zero_injection)
 
         # Estimate voltage magnitude and angle with the given estimator
-        V = self.solver.estimate(ppci, opt_vars=opt_vars)
+        eppci = self.solver.estimate(eppci, **opt_vars)
 
         if self.solver.successful:
-            # calculate the branch power flow and bus power injection based on the estimated voltage vector
-            ppci = _calc_power_flow(ppci, V)
-
-        # extract the result from ppci to ppc and pandpower network
-        self.net = _extract_result_ppci_to_pp(self.net, ppc, ppci)
+            self.net = eppci2pp(self.net, ppc, eppci)
+        else:
+            self.logger.warning("Estimation failed! Pandapower network failed to update!")
 
         # clear the aux elements and calculation results created for the substitution of bb switches
         if fuse_buses_with_bb_switch != 'all' and not self.net.switch.empty:
@@ -324,7 +304,7 @@ class StateEstimation:
         m = len(self.net.measurement)
 
         # Number of state variables (the -1 is due to the reference bus)
-        n = len(self.solver.V) + len(self.solver.delta) - 1
+        n = len(self.solver.v) + len(self.solver.delta) - 1
 
         # Chi^2 test threshold
         test_thresh = chi2.ppf(1 - chi2_prob_false, m - n)
@@ -401,7 +381,7 @@ class StateEstimation:
                 # was removed which caused this issue
                 # Covariance matrix of the residuals: \Omega = S*R = R - H*G^(-1)*H^T
                 # (S is the sensitivity matrix: r = S*e):
-                Omega = R - np.dot(self.solver.H, np.dot(np.linalg.inv(self.solver.Gm), self.solver.Ht))
+                Omega = R - np.dot(self.solver.H, np.dot(np.linalg.inv(self.solver.Gm), self.solver.H.T))
 
                 # Diagonalize \Omega:
                 Omega = np.diag(np.diag(Omega))

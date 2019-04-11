@@ -11,54 +11,61 @@ from pandapower.pypower.idx_brch import F_BUS, T_BUS
 from pandapower.pypower.idx_bus import BUS_TYPE, BASE_KV
 from pandapower.pypower.makeYbus import makeYbus
 
+from pandapower.estimation.ppc_conversion import ExtendedPPCI
+
 __all__ = ['BaseAlgebra', 'BaseAlgebraZeroInjConstraints']
 
 
 class BaseAlgebra:
-    def __init__(self, ppci, non_nan_meas_mask, z):
+    def __init__(self, eppci: ExtendedPPCI):
         np.seterr(divide='ignore', invalid='ignore')
-        self.ppci = ppci
-        self.baseMVA = ppci['baseMVA']
-        self.bus_baseKV = self.ppci['bus'][:, BASE_KV].real.astype(int)
-        self.z = z
-        self.fb = self.ppci["branch"][:, F_BUS].real.astype(int)
-        self.tb = self.ppci["branch"][:, T_BUS].real.astype(int)
-        self.n_bus = self.ppci['bus'].shape[0]
-        self.n_branch = self.ppci['branch'].shape[0]
-        self.Y_bus = None
+        self.eppci = eppci
+
+        self.fb = eppci.branch[:, F_BUS].real.astype(int)
+        self.tb = eppci.branch[:, T_BUS].real.astype(int)
+        self.n_bus = eppci.bus.shape[0]
+        self.n_branch = eppci.branch.shape[0]
+        self.baseMVA = eppci.baseMVA
+        self.bus_baseKV = eppci.bus_baseKV
+        self.num_non_slack_bus = eppci.num_non_slack_bus
+        self.non_slack_buses = eppci.non_slack_buses
+        self.delta_v_bus_mask = eppci.delta_v_bus_mask
+
+        self.z = eppci.z
+        self.r_cov = eppci.r_cov
+        self.non_nan_meas_mask = eppci.non_nan_meas_mask
+
+        self.Ybus = None
         self.Yf = None
         self.Yt = None
-        self.G = None
-        self.B = None
-        # TODO CHECK!
-        # Double the size of the bus to get mask for v_a and v_m
-        self.non_nan_meas_mask = non_nan_meas_mask
-        self.non_slack_bus_mask = (self.ppci['bus'][:, BUS_TYPE] != 3).ravel()
-        self.delta_v_bus_mask = np.r_[self.non_slack_bus_mask,
-                                      np.ones(self.non_slack_bus_mask.shape[0], dtype=bool)].ravel()
-        self.createY()
+        self.initialize_Y()
+
+        self.v = self.eppci.v_init.copy()
+        self.delta = self.eppci.delta_init.copy()
 
     # Function which builds a node admittance matrix out of the topology data
     # In addition, it provides the series admittances of lines as G_series and B_series
-    def createY(self):
+    def initialize_Y(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            Ybus, Yf, Yt = makeYbus(self.ppci["baseMVA"], self.ppci["bus"], self.ppci["branch"])
-            self.ppci['internal']['Yf'], self.ppci['internal']['Yt'],\
-                self.ppci['internal']['Ybus'] = Yf, Yt, Ybus
+            Ybus, Yf, Yt = makeYbus(self.eppci["baseMVA"], self.eppci["bus"], self.eppci["branch"])
+            self.eppci['internal']['Yf'], self.eppci['internal']['Yt'],\
+                self.eppci['internal']['Ybus'] = Yf, Yt, Ybus
 
         # create relevant matrices
         self.Ybus, self.Yf, self.Yt = Ybus, Yf, Yt
-        self.G = self.Ybus.real
-        self.B = self.Ybus.imag
-        self.Gshunt = None
-        self.Bshunt = None
 
-    def create_rx(self, v, delta):
-        hx = self.create_hx(v, delta)
+    def _e2v(self, E):
+        self.v = E[self.num_non_slack_bus:]
+        self.delta[self.non_slack_buses] = E[:self.num_non_slack_bus]
+        return self.v, self.delta
+
+    def create_rx(self, E):
+        hx = self.create_hx(E)
         return (self.z - hx).ravel()
 
-    def create_hx(self, v, delta):
+    def create_hx(self, E):
+        v, delta = self._e2v(E)
         f_bus, t_bus = self.fb, self.tb
         V = v * np.exp(1j * delta)
         Sfe = V[f_bus] * np.conj(self.Yf * V) 
@@ -77,7 +84,8 @@ class BaseAlgebra:
                    Ite * self.baseMVA / self.bus_baseKV[t_bus]] 
         return hx[self.non_nan_meas_mask]
 
-    def create_hx_jacobian(self, v, delta):
+    def create_hx_jacobian(self, E):
+        v, delta = self._e2v(E)
         # Using sparse matrix in creation sub-jacobian matrix
         f_bus, t_bus = self.fb, self.tb
         V = v * np.exp(1j * delta)
@@ -151,14 +159,16 @@ class BaseAlgebra:
 
 
 class BaseAlgebraZeroInjConstraints(BaseAlgebra):
-    def create_cx(self, v, delta, p_zero_inj, q_zero_inj):
+    def create_cx(self, E, p_zero_inj, q_zero_inj):
+        v, delta = self._e2v(E)
         V = v * np.exp(1j * delta)
         Sbus = V * np.conj(self.Ybus * V)
         c = np.r_[np.real(Sbus[p_zero_inj]),
                   np.imag(Sbus[q_zero_inj])]
         return c
 
-    def create_cx_jacobian(self, v, delta, p_zero_inj, q_zero_inj):
+    def create_cx_jacobian(self, E, p_zero_inj, q_zero_inj):
+        v, delta = self._e2v(E)
         V = v * np.exp(1j * delta)
         diagV, diagVnorm = diags(V).tocsr(), diags(V/np.abs(V)).tocsr()
         dSbus_dth, dSbus_dv = self._dSbus_dv(V, diagV, diagVnorm)
